@@ -1,0 +1,5 @@
+{
+  "name": "FinancePro - Gestão Financeira",
+  "description": "Um aplicativo completo de controle financeiro integrado ao Supabase, com suporte a filtros por competência e modalidades de Crédito, Débito e Empréstimo.",
+  "requestFramePermissions": []
+}
