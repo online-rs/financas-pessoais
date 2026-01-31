@@ -36,7 +36,13 @@ import {
   Mail,
   User as UserIcon,
   CreditCard,
-  Building2
+  Building2,
+  Target,
+  Send,
+  ShoppingCart,
+  Zap,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 
 const Card = ({ children, className = "", onClick }: { children?: React.ReactNode, className?: string, onClick?: () => void }) => (
@@ -171,9 +177,13 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [activeView, setActiveView] = useState<'DASHBOARD' | 'REPORTS'>('DASHBOARD');
   const [transacoes, setTransacoes] = useState<Transacao[]>([]);
+  const [saldoProjetado, setSaldoProjetado] = useState<number>(0);
+  const [mercadoTotal, setMercadoTotal] = useState<number>(0);
   const [loading, setLoading] = useState(false);
+  const [reportLoading, setReportLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [pessoaAtiva, setPessoaAtiva] = useState<'BRUNO' | 'FERNANDA'>('BRUNO');
+  const [showSimulation, setShowSimulation] = useState(false);
   
   const [filterMode, setFilterMode] = useState<'MONTH' | 'RANGE' | 'ALL'>('MONTH');
   const [competenciaInicio, setCompetenciaInicio] = useState(() => {
@@ -217,23 +227,88 @@ export default function App() {
     if (!session) return;
     setLoading(true);
     try {
-      const { data, error } = await supabase
+      // Fetch Transacoes
+      const { data: transacoesData, error: transacoesError } = await supabase
         .from('despesas')
         .select('*')
         .eq('pessoa', pessoaAtiva)
         .order('data', { ascending: false })
         .order('id', { ascending: false });
 
-      if (error) throw error;
-      setTransacoes(data || []);
+      if (transacoesError) throw transacoesError;
+      setTransacoes(transacoesData || []);
+
+      // Fetch Saldo Projetado from View
+      const { data: viewData, error: viewError } = await supabase
+        .from('view_saldo_atual')
+        .select('saldo_final')
+        .maybeSingle();
+      
+      if (!viewError && viewData) {
+        setSaldoProjetado(viewData.saldo_final);
+      }
+
+      // Fetch Mercado Total from resumo_despesas view
+      const { data: resumoData, error: resumoError } = await supabase
+        .from('resumo_despesas')
+        .select('valor_total')
+        .eq('nome', 'MERCADO')
+        .eq('competência', competenciaInicio)
+        .maybeSingle();
+      
+      if (!resumoError && resumoData) {
+        setMercadoTotal(resumoData.valor_total);
+      } else {
+        setMercadoTotal(0);
+      }
+
     } catch (err) {
       console.error(err);
     } finally {
       setLoading(false);
     }
-  }, [pessoaAtiva, session]);
+  }, [pessoaAtiva, session, competenciaInicio]);
 
   useEffect(() => { fetchTransacoes(); }, [fetchTransacoes]);
+
+  // Lógica de Simulação de Recorrentes
+  const transacoesSimuladas = useMemo(() => {
+    if (!showSimulation || filterMode !== 'MONTH') return [];
+    
+    // 1. Pegar todos os nomes de transações recorrentes que já existiram
+    const recorrentesUnicos = Array.from(new Set(
+      transacoes
+        .filter(t => t.recorrente && t.tipo === 'SAÍDA')
+        .map(t => t.nome)
+    ));
+
+    // 2. Para a competência atual, ver quais desses nomes NÃO existem
+    const nomesNoMesAtual = new Set(
+      transacoes
+        .filter(t => t.competência === competenciaInicio)
+        .map(t => t.nome)
+    );
+
+    const faltantes = recorrentesUnicos.filter(nome => !nomesNoMesAtual.has(nome));
+
+    // 3. Criar os objetos simulados baseados no último lançamento desse nome
+    return faltantes.map(nome => {
+      const ultimoExemplo = transacoes.find(t => t.nome === nome && t.recorrente);
+      if (!ultimoExemplo) return null;
+
+      const [year, month] = competenciaInicio.split('/');
+      const simulatedData = `${year}-${month}-01`;
+
+      return {
+        ...ultimoExemplo,
+        id: `sim-${ultimoExemplo.id}`, // ID prefixado para evitar conflito
+        data: simulatedData,
+        competência: competenciaInicio,
+        status: false,
+        isSimulation: true // Flag para UI
+      } as any;
+    }).filter(Boolean);
+  }, [transacoes, showSimulation, competenciaInicio, filterMode]);
 
   const moveMonth = (offset: number) => {
     const [y, m] = competenciaInicio.split('/').map(Number);
@@ -271,12 +346,19 @@ export default function App() {
   }, [transacoes]);
 
   const filteredData = useMemo(() => {
-    let base = transacoes;
+    let base = [...transacoes];
+    
+    // Se a simulação estiver ativa, injetar simulados na base antes de filtrar
+    if (showSimulation && filterMode === 'MONTH') {
+      base = [...transacoesSimuladas, ...base];
+    }
+
     if (filterMode === 'MONTH') {
       base = base.filter(t => t.competência === competenciaInicio);
     } else if (filterMode === 'RANGE') {
       base = base.filter(t => t.competência >= competenciaInicio && t.competência <= competenciaFim);
     }
+    
     if (!searchTerm) return base;
     const lowerSearch = searchTerm.toLowerCase();
     return base.filter(t => 
@@ -284,7 +366,7 @@ export default function App() {
       t.local?.toLowerCase().includes(lowerSearch) ||
       t.descrição?.toLowerCase().includes(lowerSearch)
     );
-  }, [transacoes, competenciaInicio, competenciaFim, filterMode, searchTerm]);
+  }, [transacoes, transacoesSimuladas, competenciaInicio, competenciaFim, filterMode, searchTerm, showSimulation]);
 
   const statsPeriodo = useMemo(() => {
     const entradasEfetivadas = filteredData
@@ -293,9 +375,12 @@ export default function App() {
     const saidasTotal = filteredData
       .filter(t => t.tipo === 'SAÍDA')
       .reduce((acc, t) => acc + t.valor, 0);
+    
+    // Pendentes agora incluem simulados se o modo estiver ativo
     const saidasPendentes = filteredData
       .filter(t => t.tipo === 'SAÍDA' && !t.status)
       .reduce((acc, t) => acc + t.valor, 0);
+
     const emprestimos = filteredData
       .filter(t => t.modalidade === 'EMPRÉSTIMO' && !t.status)
       .reduce((acc, t) => acc + t.valor, 0);
@@ -304,7 +389,8 @@ export default function App() {
   }, [filteredData]);
 
   const reportGroups = useMemo(() => {
-    const byModalidade = filteredData
+    const onlyReal = filteredData.filter(t => !(t as any).isSimulation);
+    const byModalidade = onlyReal
       .filter(t => t.tipo === 'SAÍDA')
       .reduce((acc: any, t) => {
         if (!acc[t.modalidade]) acc[t.modalidade] = 0;
@@ -312,14 +398,14 @@ export default function App() {
         return acc;
       }, {});
 
-    const byStatus = filteredData.reduce((acc: any, t) => {
+    const byStatus = onlyReal.reduce((acc: any, t) => {
       const label = t.status ? 'EFETIVADO' : 'PENDENTE';
       if (!acc[label]) acc[label] = 0;
       acc[label] += t.valor;
       return acc;
     }, {});
 
-    const byName = filteredData
+    const byName = onlyReal
       .filter(t => t.tipo === 'SAÍDA')
       .reduce((acc: any, t) => {
         const name = t.nome || 'Sem Nome';
@@ -333,8 +419,8 @@ export default function App() {
       .map(([nome, data]: any) => ({ nome, ...data }))
       .sort((a, b) => b.total - a.total);
 
-    const entradas = filteredData.filter(t => t.tipo === 'ENTRADA').reduce((acc, t) => acc + t.valor, 0);
-    const saidas = filteredData.filter(t => t.tipo === 'SAÍDA').reduce((acc, t) => acc + t.valor, 0);
+    const entradas = onlyReal.filter(t => t.tipo === 'ENTRADA').reduce((acc, t) => acc + t.valor, 0);
+    const saidas = onlyReal.filter(t => t.tipo === 'SAÍDA').reduce((acc, t) => acc + t.valor, 0);
 
     return { byModalidade, byStatus, entriesByName, entradas, saidas };
   }, [filteredData]);
@@ -359,6 +445,23 @@ export default function App() {
     }
   };
 
+  const handleSendReport = async () => {
+    if (!confirm('Deseja enviar o relatório para o webhook?')) return;
+    setReportLoading(true);
+    try {
+      await fetch('https://projeto1-n8n.ixlh2p.easypanel.host/webhook/nubank', { 
+        method: 'GET',
+        mode: 'no-cors'
+      });
+      alert('Relatório enviado com sucesso!');
+    } catch (err) {
+      console.error(err);
+      alert('Erro ao enviar relatório.');
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
   const toggleSelect = (id: number) => {
     const next = new Set(selectedPendingIds);
     if (next.has(id)) next.delete(id); else next.add(id);
@@ -377,8 +480,14 @@ export default function App() {
     setSelectedPendingIds(next);
   };
 
-  const openEdit = (item: Transacao) => {
-    setFormData({ ...item });
+  const openEdit = (item: any) => {
+    if (item.isSimulation) {
+      // Se for simulado, abrir como "Novo Lançamento" pré-preenchido
+      const { id, isSimulation, ...cleanData } = item;
+      setFormData({ ...cleanData, status: false });
+    } else {
+      setFormData({ ...item });
+    }
     setIsModalOpen(true);
   };
 
@@ -399,7 +508,7 @@ export default function App() {
     const pAtual = Number(payload.parcela_atual || 1);
     const pTotal = Number(payload.parcela_quantidades || 1);
     try {
-      if (id) {
+      if (id && typeof id === 'number') {
         const comp = `${payload.data!.split('-')[0]}/${payload.data!.split('-')[1]}`;
         await supabase.from('despesas').update({ ...payload, valor, competência: comp, parcela_atual: pAtual, parcela_quantidades: pTotal }).eq('id', id);
       } else {
@@ -498,9 +607,22 @@ export default function App() {
                <button onClick={() => setFilterMode('RANGE')} className={`px-4 py-2 text-[10px] font-bold transition-all rounded-lg ${filterMode === 'RANGE' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400'}`}>INTERVALO</button>
                <button onClick={() => setFilterMode('ALL')} className={`px-4 py-2 text-[10px] font-bold transition-all rounded-lg ${filterMode === 'ALL' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400'}`}>TUDO</button>
             </div>
-            <div className="relative group w-full md:w-64">
-              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-              <input type="text" placeholder="Filtrar lançamentos..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="w-full pl-10 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs outline-none focus:ring-2 focus:ring-indigo-500 transition-all" />
+            
+            <div className="flex items-center gap-3 w-full md:w-auto">
+              {filterMode === 'MONTH' && (
+                <button 
+                  onClick={() => setShowSimulation(!showSimulation)}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all border ${showSimulation ? 'bg-amber-100 border-amber-300 text-amber-700 shadow-sm' : 'bg-slate-50 border-slate-200 text-slate-400 hover:border-slate-300'}`}
+                >
+                  <Zap size={14} className={showSimulation ? 'animate-pulse' : ''} />
+                  <span className="hidden sm:inline">Simular Recorrentes</span>
+                </button>
+              )}
+              
+              <div className="relative group flex-1 md:w-64">
+                <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input type="text" placeholder="Filtrar lançamentos..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="w-full pl-10 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs outline-none focus:ring-2 focus:ring-indigo-500 transition-all" />
+              </div>
             </div>
           </div>
           {filterMode !== 'ALL' && (
@@ -533,47 +655,96 @@ export default function App() {
         </div>
 
         {activeView === 'DASHBOARD' && (
-          <>
-            <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-3 md:gap-4 animate-in fade-in duration-500">
-              <Card className="p-4 border-l-4 border-emerald-500">
-                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Entradas Totais</span>
-                <h3 className="text-sm md:text-base font-black text-slate-900 mt-1">R$ {statsAtemporal.entradasTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
-              </Card>
-              <Card className="p-4 border-l-4 border-rose-500 bg-rose-50/10">
-                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Saídas Totais</span>
-                <h3 className="text-sm md:text-base font-black text-rose-700 mt-1">R$ {statsAtemporal.saidasTotalAtemporal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
-              </Card>
-              <Card onClick={() => { setSelectedPendingIds(new Set()); setIsExpectationInModalOpen(true); }} className="p-4 border-l-4 border-blue-500 bg-blue-50/20">
-                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Exp. de Entradas</span>
-                <h3 className="text-sm md:text-base font-black text-blue-600 mt-1">R$ {statsAtemporal.entradasPendentes.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
-              </Card>
-              <Card className="p-4 border-l-4 border-teal-400">
-                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Filtro: Entradas</span>
-                <h3 className="text-sm md:text-base font-black text-slate-900 mt-1">R$ {statsPeriodo.entradasPeriodo.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
-              </Card>
-              <Card className="p-4 border-l-4 border-indigo-600 bg-indigo-50/10">
-                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Filtro: Saldo</span>
-                <h3 className={`text-sm md:text-base font-black mt-1 ${statsPeriodo.saldoPeriodo >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>R$ {statsPeriodo.saldoPeriodo.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
-              </Card>
-              <Card onClick={() => { setSelectedPendingIds(new Set()); setIsPendingOutModalOpen(true); }} className="p-4 border-l-4 border-rose-500">
-                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Filtro: Pendentes</span>
-                <h3 className="text-sm md:text-base font-black text-rose-600 mt-1">R$ {statsPeriodo.saidasPendentes.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
-              </Card>
+          <div className="space-y-4 animate-in fade-in duration-500">
+            {/* LINHA 1: Visão Geral / Patrimonial */}
+            <div className="flex items-center justify-between">
+              <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Visão Geral (Patrimonial)</h3>
+              <button 
+                onClick={handleSendReport} 
+                disabled={reportLoading}
+                className="flex items-center gap-2 px-3 py-1.5 bg-indigo-50 text-indigo-600 rounded-lg text-[10px] font-black uppercase tracking-wide hover:bg-indigo-100 transition-colors disabled:opacity-50"
+              >
+                {reportLoading ? <RefreshCw className="animate-spin" size={12} /> : <Send size={12} />}
+                Enviar Relatório
+              </button>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
               <Card onClick={() => setIsBalanceModalOpen(true)} className="p-4 border-l-4 border-indigo-500 bg-indigo-50/30">
                 <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Líquido Real</span>
                 <h3 className={`text-sm md:text-base font-black mt-1 ${statsAtemporal.saldoDisponivel >= 0 ? 'text-indigo-700' : 'text-rose-600'}`}>R$ {statsAtemporal.saldoDisponivel.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
               </Card>
-              <Card className="p-4 border-l-4 border-amber-500">
-                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Empréstimos</span>
-                <h3 className="text-sm md:text-base font-black text-amber-600 mt-1">R$ {statsPeriodo.emprestimos.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
+
+              <Card className="p-4 border-l-4 border-violet-500 bg-violet-50/20">
+                <div className="flex items-center gap-1">
+                  <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Líquido Projetado</span>
+                  <Target size={10} className="text-violet-400" />
+                </div>
+                <h3 className="text-sm md:text-base font-black text-violet-700 mt-1">R$ {saldoProjetado.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
+              </Card>
+
+              <Card className="p-4 border-l-4 border-emerald-500">
+                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Entradas Totais</span>
+                <h3 className="text-sm md:text-base font-black text-slate-900 mt-1">R$ {statsAtemporal.entradasTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
+              </Card>
+              
+              <Card className="p-4 border-l-4 border-rose-500 bg-rose-50/10">
+                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Saídas Totais</span>
+                <h3 className="text-sm md:text-base font-black text-rose-700 mt-1">R$ {statsAtemporal.saidasTotalAtemporal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
               </Card>
             </div>
 
-            <div className="grid grid-cols-1">
+            {/* LINHA 2: Visão Operacional / Período */}
+            <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1 mt-4">Visão Operacional (Período)</h3>
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 md:gap-4">
+              <Card className="p-4 border-l-4 border-teal-400">
+                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Filtro: Entradas</span>
+                <h3 className="text-sm md:text-base font-black text-slate-900 mt-1">R$ {statsPeriodo.entradasPeriodo.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
+              </Card>
+              
+              <Card className="p-4 border-l-4 border-indigo-600 bg-indigo-50/10">
+                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Filtro: Saldo</span>
+                <h3 className={`text-sm md:text-base font-black mt-1 ${statsPeriodo.saldoPeriodo >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>R$ {statsPeriodo.saldoPeriodo.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
+              </Card>
+              
+              <Card onClick={() => { setSelectedPendingIds(new Set()); setIsPendingOutModalOpen(true); }} className={`p-4 border-l-4 transition-all ${showSimulation ? 'border-amber-500 bg-amber-50/20' : 'border-rose-500'}`}>
+                <div className="flex items-center justify-between">
+                  <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">
+                    {showSimulation ? 'Pendentes + Simulação' : 'Filtro: Pendentes'}
+                  </span>
+                  {showSimulation && <Zap size={10} className="text-amber-500" />}
+                </div>
+                <h3 className={`text-sm md:text-base font-black mt-1 ${showSimulation ? 'text-amber-700' : 'text-rose-600'}`}>
+                  R$ {statsPeriodo.saidasPendentes.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                </h3>
+              </Card>
+
+              <Card onClick={() => { setSelectedPendingIds(new Set()); setIsExpectationInModalOpen(true); }} className="p-4 border-l-4 border-blue-500 bg-blue-50/20">
+                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Exp. de Entradas</span>
+                <h3 className="text-sm md:text-base font-black text-blue-600 mt-1">R$ {statsAtemporal.entradasPendentes.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
+              </Card>
+
+              <Card className="p-4 border-l-4 border-amber-500 bg-amber-50/10">
+                <div className="flex items-center gap-1">
+                  <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Mercado</span>
+                  <ShoppingCart size={10} className="text-amber-500" />
+                </div>
+                <h3 className="text-sm md:text-base font-black text-amber-600 mt-1">R$ {mercadoTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
+              </Card>
+
+              <Card className="p-4 border-l-4 border-rose-400">
+                <span className="text-[7px] font-black text-slate-400 uppercase tracking-tighter">Empréstimos</span>
+                <h3 className="text-sm md:text-base font-black text-rose-500 mt-1">R$ {statsPeriodo.emprestimos.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</h3>
+              </Card>
+            </div>
+
+            <div className="grid grid-cols-1 pt-4">
               <Card>
                 <div className="p-3 md:p-5 border-b border-slate-100 flex items-center justify-between bg-slate-50/30">
                   <h4 className="text-[9px] md:text-xs font-bold uppercase tracking-widest text-slate-500">{filterMode === 'ALL' ? 'Todos os Lançamentos' : `Lançamentos: ${competenciaInicio}${filterMode === 'RANGE' ? ' até ' + competenciaFim : ''}`}</h4>
-                  <div className="text-[9px] font-bold text-slate-400 uppercase">{filteredData.length} Reg.</div>
+                  <div className="flex items-center gap-4">
+                    {showSimulation && <span className="text-[8px] font-black text-amber-600 bg-amber-100 px-2 py-0.5 rounded-full uppercase">Modo Simulação Ativo</span>}
+                    <div className="text-[9px] font-bold text-slate-400 uppercase">{filteredData.length} Reg.</div>
+                  </div>
                 </div>
                 <div className="overflow-x-hidden">
                   <table className="w-full text-left table-fixed">
@@ -586,32 +757,47 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-50">
-                      {filteredData.map(item => (
-                        <tr key={item.id} onClick={() => openEdit(item)} className="hover:bg-indigo-50/40 transition-colors group cursor-pointer">
-                          <td className="px-2 md:px-6 py-3 text-[9px] md:text-sm font-medium text-slate-500 whitespace-nowrap">{new Date(item.data + 'T12:00:00').toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}</td>
-                          <td className="px-2 md:px-6 py-3 overflow-hidden">
-                            <p className="text-[9px] md:text-sm font-bold text-slate-800 truncate">{item.nome}</p>
-                            <div className="flex flex-wrap gap-1 mt-0.5">
-                              {item.local && <span className="inline-flex items-center text-[6px] md:text-[8px] text-slate-500 border border-slate-100 px-1 rounded bg-slate-50 font-bold uppercase"><Building2 size={8} className="mr-0.5" /> {item.local}</span>}
-                              {item.recorrente && <span className="inline-flex items-center text-[6px] md:text-[8px] text-indigo-500 border border-indigo-100 px-1 rounded bg-white font-bold uppercase"><Repeat size={6} className="mr-0.5" /> R</span>}
-                              {item.parcela_quantidades && item.parcela_quantidades > 1 && (<span className="inline-flex items-center text-[6px] md:text-[8px] text-amber-600 border border-amber-100 px-1 rounded bg-white font-black">{item.parcela_atual}/{item.parcela_quantidades}</span>)}
-                            </div>
-                          </td>
-                          <td className={`px-2 md:px-6 py-3 text-[9px] md:text-sm font-black text-right whitespace-nowrap ${item.tipo === 'ENTRADA' ? 'text-emerald-600' : 'text-rose-600'}`}>{item.valor.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</td>
-                          <td className="px-2 md:px-6 py-3 text-center"><span className={`inline-block w-full max-w-[55px] md:max-w-none py-1 rounded-lg text-[7px] md:text-[10px] font-bold ${item.status ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'} uppercase`}>{item.status ? 'PAGO' : 'PEND'}</span></td>
-                        </tr>
-                      ))}
+                      {filteredData.map(item => {
+                        const isSim = (item as any).isSimulation;
+                        return (
+                          <tr 
+                            key={item.id} 
+                            onClick={() => openEdit(item)} 
+                            className={`hover:bg-indigo-50/40 transition-colors group cursor-pointer ${isSim ? 'bg-amber-50/20 border-l-2 border-amber-300 border-dashed opacity-80' : ''}`}
+                          >
+                            <td className="px-2 md:px-6 py-3 text-[9px] md:text-sm font-medium text-slate-500 whitespace-nowrap">{new Date(item.data + 'T12:00:00').toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}</td>
+                            <td className="px-2 md:px-6 py-3 overflow-hidden">
+                              <p className="text-[9px] md:text-sm font-bold text-slate-800 truncate flex items-center gap-1.5">
+                                {item.nome}
+                                {isSim && <span className="text-[7px] font-black px-1.5 py-0.5 bg-amber-500 text-white rounded uppercase">Simulado</span>}
+                              </p>
+                              <div className="flex flex-wrap gap-1 mt-0.5">
+                                {item.local && <span className="inline-flex items-center text-[6px] md:text-[8px] text-slate-500 border border-slate-100 px-1 rounded bg-slate-50 font-bold uppercase"><Building2 size={8} className="mr-0.5" /> {item.local}</span>}
+                                {item.recorrente && <span className={`inline-flex items-center text-[6px] md:text-[8px] border px-1 rounded bg-white font-bold uppercase ${isSim ? 'text-amber-500 border-amber-200' : 'text-indigo-500 border-indigo-100'}`}><Repeat size={6} className="mr-0.5" /> R</span>}
+                                {item.parcela_quantidades && item.parcela_quantidades > 1 && (<span className="inline-flex items-center text-[6px] md:text-[8px] text-amber-600 border border-amber-100 px-1 rounded bg-white font-black">{item.parcela_atual}/{item.parcela_quantidades}</span>)}
+                              </div>
+                            </td>
+                            <td className={`px-2 md:px-6 py-3 text-[9px] md:text-sm font-black text-right whitespace-nowrap ${item.tipo === 'ENTRADA' ? 'text-emerald-600' : 'text-rose-600'}`}>{item.valor.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</td>
+                            <td className="px-2 md:px-6 py-3 text-center">
+                              <span className={`inline-block w-full max-w-[55px] md:max-w-none py-1 rounded-lg text-[7px] md:text-[10px] font-bold ${item.status ? 'bg-emerald-100 text-emerald-700' : isSim ? 'bg-amber-200 text-amber-800 border border-amber-300' : 'bg-amber-100 text-amber-700'} uppercase`}>
+                                {item.status ? 'PAGO' : isSim ? 'PROJET' : 'PEND'}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })}
                       {filteredData.length === 0 && (<tr><td colSpan={4} className="px-6 py-12 text-center text-slate-400 font-medium italic">Sem registros.</td></tr>)}
                     </tbody>
                   </table>
                 </div>
               </Card>
             </div>
-          </>
+          </div>
         )}
 
         {activeView === 'REPORTS' && (
           <div className="space-y-6 animate-in slide-in-from-bottom-4 duration-500">
+            {/* O Histórico e Relatórios sempre ignoram simulações */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <Card className="p-6 bg-gradient-to-br from-white to-slate-50">
                 <div className="flex items-center gap-3 mb-6 text-indigo-600">
@@ -742,8 +928,8 @@ export default function App() {
           </div>
 
           <div className="flex gap-2 pt-4">
-            {formData.id && (<button type="button" onClick={async () => { if(confirm("Excluir?")) { await supabase.from('despesas').delete().eq('id', formData.id); setIsModalOpen(false); fetchTransacoes(); } }} className="p-4 bg-rose-50 text-rose-600 rounded-2xl border border-rose-100 transition-colors hover:bg-rose-100"><Trash2 size={24} /></button>)}
-            <button type="submit" className="flex-1 py-4 bg-indigo-600 text-white font-black rounded-2xl shadow-lg uppercase tracking-widest text-xs hover:bg-indigo-700 transition-colors">{formData.id ? "Atualizar" : "Salvar"}</button>
+            {formData.id && typeof formData.id === 'number' && (<button type="button" onClick={async () => { if(confirm("Excluir?")) { await supabase.from('despesas').delete().eq('id', formData.id); setIsModalOpen(false); fetchTransacoes(); } }} className="p-4 bg-rose-50 text-rose-600 rounded-2xl border border-rose-100 transition-colors hover:bg-rose-100"><Trash2 size={24} /></button>)}
+            <button type="submit" className="flex-1 py-4 bg-indigo-600 text-white font-black rounded-2xl shadow-lg uppercase tracking-widest text-xs hover:bg-indigo-700 transition-colors">{formData.id && typeof formData.id === 'number' ? "Atualizar" : "Salvar"}</button>
           </div>
         </form>
       </Modal>
@@ -773,7 +959,10 @@ const PendingBatchModal = ({ isOpen, onClose, title, items, selectedIds, onToggl
               <div className={`w-5 h-5 rounded-lg border-2 flex items-center justify-center ${selectedIds.has(t.id) ? 'bg-indigo-600 border-indigo-600 text-white' : 'bg-white border-slate-300'}`}>{selectedIds.has(t.id) && <CheckCircle size={14} />}</div>
               <div className="flex-1 overflow-hidden">
                 <div className="flex justify-between items-start gap-2">
-                  <span className="text-xs font-bold text-slate-800 truncate">{t.nome}</span>
+                  <span className="text-xs font-bold text-slate-800 truncate flex items-center gap-2">
+                    {t.nome}
+                    {t.isSimulation && <span className="text-[6px] bg-amber-500 text-white px-1 rounded uppercase">SIM</span>}
+                  </span>
                   <span className="text-xs font-black shrink-0">R$ {t.valor.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
                 </div>
               </div>
@@ -781,9 +970,12 @@ const PendingBatchModal = ({ isOpen, onClose, title, items, selectedIds, onToggl
           ))}
         </div>
         
-        <button onClick={onEfetivar} disabled={selectedIds.size === 0 || loading} className={`w-full py-4 rounded-2xl font-black transition-all shadow-lg flex items-center justify-center gap-2 ${selectedIds.size > 0 ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-400 cursor-not-allowed'}`}>
+        <button onClick={onEfetivar} disabled={selectedIds.size === 0 || loading || Array.from(selectedIds).some(id => typeof id === 'string')} className={`w-full py-4 rounded-2xl font-black transition-all shadow-lg flex items-center justify-center gap-2 ${selectedIds.size > 0 ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-400 cursor-not-allowed'}`}>
           {loading ? <RefreshCw className="animate-spin" size={20} /> : 'EFETIVAR SELECIONADOS'}
         </button>
+        {Array.from(selectedIds).some(id => typeof id === 'string') && (
+          <p className="text-[9px] text-center text-amber-600 font-bold uppercase">Lançamentos simulados devem ser efetivados individualmente.</p>
+        )}
       </div>
     </Modal>
   );
